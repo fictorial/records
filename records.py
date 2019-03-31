@@ -1,26 +1,39 @@
 # -*- coding: utf-8 -*-
 
 import os
-from code import interact
-from datetime import datetime
+from sys import stdout
 from collections import OrderedDict
+from contextlib import contextmanager
+from inspect import isclass
 
 import tablib
 from docopt import docopt
-from sqlalchemy import text, create_engine
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy import create_engine, exc, inspect, text
+from sqlalchemy.pool import QueuePool
 
 DATABASE_URL = os.environ.get('DATABASE_URL')
+
+
+def isexception(obj):
+    """Given an object, return a boolean indicating whether it is an instance
+    or subclass of :py:class:`Exception`.
+    """
+    if isinstance(obj, Exception):
+        return True
+    if isclass(obj) and issubclass(obj, Exception):
+        return True
+    return False
 
 
 class Record(object):
     """A row, from a query, from a database."""
     __slots__ = ('_keys', '_values')
+
     def __init__(self, keys, values):
         self._keys = keys
         self._values = values
 
-        # Esure that lengths match properly.
+        # Ensure that lengths match properly.
         assert len(self._keys) == len(self._values)
 
     def keys(self):
@@ -42,6 +55,8 @@ class Record(object):
         # Support for string-based lookup.
         if key in self.keys():
             i = self.keys().index(key)
+            if self.keys().count(key) > 1:
+                raise KeyError("Record contains multiple '{}' fields.".format(key))
             return self.values()[i]
 
         raise KeyError("Record contains no '{}' field.".format(key))
@@ -53,16 +68,7 @@ class Record(object):
             raise AttributeError(e)
 
     def __dir__(self):
-        standard = [
-            # Would love to do this programatically, but couldn't figure out how.
-            '__class__', '__ddir__', '__delattr__', '__doc__', '__format__',
-            '__getattr__', '__getattribute__', '__getitem__', '__hash__',
-            '__init__', '__module__', '__new__', '__reduce__', '__reduce_ex__',
-            '__repr__', '__setattr__', '__sizeof__', '__slots__', '__str__',
-            '__subclasshook__', '_keys', '_values', 'as_dict', 'dataset',
-            'export', 'get', 'keys', 'values'
-        ]
-
+        standard = dir(super(Record, self))
         # Merge standard attrs with generated ones (from column names).
         return sorted(standard + [str(k) for k in self.keys()])
 
@@ -103,8 +109,7 @@ class RecordCollection(object):
         self.pending = True
 
     def __repr__(self):
-        r = '<RecordCollection size={} pending={}>'.format(len(self), self.pending)
-        return r
+        return '<RecordCollection size={} pending={}>'.format(len(self), self.pending)
 
     def __iter__(self):
         """Iterate over all rows, consuming the underlying generator
@@ -117,9 +122,12 @@ class RecordCollection(object):
                 yield self[i]
             else:
                 # Throws StopIteration when done.
-                yield next(self)
+                # Prevent StopIteration bubbling from generator, following https://www.python.org/dev/peps/pep-0479/
+                try:
+                    yield next(self)
+                except StopIteration:
+                    return
             i += 1
-
 
     def next(self):
         return self.__next__()
@@ -165,6 +173,11 @@ class RecordCollection(object):
         # Create a new Tablib Dataset.
         data = tablib.Dataset()
 
+        # If the RecordCollection is empty, just return the empty set
+        # Check number of rows by typecasting to list
+        if len(list(self)) == 0:
+            return data
+
         # Set the column names as headers on Tablib Dataset.
         first = self[0]
 
@@ -192,24 +205,80 @@ class RecordCollection(object):
     def as_dict(self, ordered=False):
         return self.all(as_dict=not(ordered), as_ordereddict=ordered)
 
+    def first(self, default=None, as_dict=False, as_ordereddict=False):
+        """Returns a single record for the RecordCollection, or `default`. If
+        `default` is an instance or subclass of Exception, then raise it
+        instead of returning it."""
+
+        # Try to get a record, or return/raise default.
+        try:
+            record = self[0]
+        except IndexError:
+            if isexception(default):
+                raise default
+            return default
+
+        # Cast and return.
+        if as_dict:
+            return record.as_dict()
+        elif as_ordereddict:
+            return record.as_dict(ordered=True)
+        else:
+            return record
+
+    def one(self, default=None, as_dict=False, as_ordereddict=False):
+        """Returns a single record for the RecordCollection, ensuring that it
+        is the only record, or returns `default`. If `default` is an instance
+        or subclass of Exception, then raise it instead of returning it."""
+
+        # Ensure that we don't have more than one row.
+        try:
+            self[1]
+        except IndexError:
+            return self.first(default=default, as_dict=as_dict, as_ordereddict=as_ordereddict)
+        else:
+            raise ValueError('RecordCollection contained more than one row. '
+                             'Expects only one row when using '
+                             'RecordCollection.one')
+
+    def scalar(self, default=None):
+        """Returns the first column of the first row, or `default`."""
+        row = self.one()
+        return row[0] if row else default
+
 
 class Database(object):
-    """A Database connection."""
+    """A Database. Encapsulates a url and an SQLAlchemy engine with a pool of
+    connections.
+    """
 
-    def __init__(self, db_url=None):
+    def __init__(self, db_url=None, **kwargs):
         # If no db_url was provided, fallback to $DATABASE_URL.
         self.db_url = db_url or DATABASE_URL
 
         if not self.db_url:
             raise ValueError('You must provide a db_url.')
 
-        # Connect to the database.
-        self.db = create_engine(self.db_url).connect()
+        # Create an engine.
+        self._engine = create_engine(self.db_url, **kwargs)
         self.open = True
 
-    def close(self):
-        """Closes the connection to the Database."""
-        self.db.close()
+    def close(self, force=False):
+        """Closes the Database.
+
+        By default, the database must have no checked-out connections for this
+        operation to complete. This may be overriden by setting force=True, but
+        may result in stray connections.
+        """
+        if not force:
+            pool = self._engine.pool
+            if isinstance(pool, QueuePool) and pool.checkedout() != 0:
+                err_msg = ('Database has {} checked out connections. Consume '
+                           'all RecordCollections created by this database '
+                           'and try again.'.format(pool.checkedout()))
+                raise RecordsException(err_msg)
+
+        self._engine.dispose()
         self.open = False
 
     def __enter__(self):
@@ -225,20 +294,86 @@ class Database(object):
         """Returns a list of table names for the connected database."""
 
         # Setup SQLAlchemy for Database inspection.
-        metadata = declarative_base().metadata
-        metadata.reflect(create_engine(self.db_url))
+        return inspect(self._engine).get_table_names()
 
-        # Serve the table names.
-        return metadata.tables.keys()
+    def get_connection(self, close_with_result=False):
+        """Get a connection to this Database. Connections are retrieved from a
+        pool. By default, the retrieved connection remains open. Setting
+        close_with_result to True returns the connection to the pool once a
+        result is consumed.
+        """
+        if not self.open:
+            raise exc.ResourceClosedError('Database closed.')
+
+        return Connection(self._engine.contextual_connect(close_with_result))
 
     def query(self, query, fetchall=False, **params):
-        """Executes the given SQL query against the Database. Parameters
-        can, optionally, be provided. Returns a RecordCollection, which can be
+        """Executes the given SQL query against the Database. Parameters can,
+        optionally, be provided. Returns a RecordCollection, which can be
         iterated over to get result rows as dictionaries.
+        """
+        conn = self.get_connection(True);
+        return conn.query(query, fetchall, **params)
+
+    def bulk_query(self, query, *multiparams):
+        """Bulk insert or update."""
+
+        conn = self.get_connection(True);
+        conn.bulk_query(query, *multiparams)
+
+    def query_file(self, path, fetchall=False, **params):
+        """Like Database.query, but takes a filename to load a query from."""
+
+        conn = self.get_connection(True);
+        return conn.query_file(path, fetchall, **params)
+
+    def bulk_query_file(self, path, *multiparams):
+        """Like Database.bulk_query, but takes a filename to load a query from."""
+
+        conn = self.get_connection(True);
+        conn.bulk_query_file(path, *multiparams)
+
+    @contextmanager
+    def transaction(self):
+        """A context manager for executing a transaction on this Database."""
+
+        conn = self.get_connection()
+        tx = conn.transaction()
+        try:
+            yield conn
+            tx.commit()
+        except:
+            tx.rollback()
+        finally:
+            conn.close()
+
+
+class Connection(object):
+    """A Database connection."""
+
+    def __init__(self, connection):
+        self._conn = connection
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc, val, traceback):
+        self.close()
+
+    def __repr__(self):
+        return '<Connection open={}>'.format(not self._conn.closed)
+
+    def query(self, query, fetchall=False, **params):
+        """Executes the given SQL query against the connected Database.
+        Parameters can, optionally, be provided. Returns a RecordCollection,
+        which can be iterated over to get result rows as dictionaries.
         """
 
         # Execute the given query.
-        cursor = self.db.execute(text(query), **params) # TODO: PARAMS GO HERE
+        cursor = self._conn.execute(text(query), **params) # TODO: PARAMS GO HERE
 
         # Row-by-row Record generator.
         row_gen = (Record(cursor.keys(), row) for row in cursor)
@@ -252,12 +387,17 @@ class Database(object):
 
         return results
 
+    def bulk_query(self, query, *multiparams):
+        """Bulk insert or update."""
+
+        self._conn.execute(text(query), *multiparams)
+
     def query_file(self, path, fetchall=False, **params):
-        """Like Database.query, but takes a filename to load a query from."""
+        """Like Connection.query, but takes a filename to load a query from."""
 
         # If path doesn't exists
         if not os.path.exists(path):
-            raise IOError("File '{}'' not found!".format(path))
+            raise IOError("File '{}' not found!".format(path))
 
         # If it's a directory
         if os.path.isdir(path):
@@ -270,10 +410,36 @@ class Database(object):
         # Defer processing to self.query method.
         return self.query(query=query, fetchall=fetchall, **params)
 
+    def bulk_query_file(self, path, *multiparams):
+        """Like Connection.bulk_query, but takes a filename to load a query
+        from.
+        """
+
+         # If path doesn't exists
+        if not os.path.exists(path):
+            raise IOError("File '{}'' not found!".format(path))
+
+        # If it's a directory
+        if os.path.isdir(path):
+            raise IOError("'{}' is a directory!".format(path))
+
+        # Read the given .sql file into memory.
+        with open(path) as f:
+            query = f.read()
+
+        self._conn.execute(text(query), *multiparams)
+
     def transaction(self):
         """Returns a transaction object. Call ``commit`` or ``rollback``
         on the returned object as appropriate."""
-        return self.db.begin()
+
+        return self._conn.begin()
+
+
+class RecordsException(Exception):
+    """A records-specific exception."""
+    pass
+
 
 def _reduce_datetimes(row):
     """Receives a row, converts datetimes to strings."""
@@ -286,11 +452,13 @@ def _reduce_datetimes(row):
     return tuple(row)
 
 def cli():
+    supported_formats = 'csv tsv json yaml html xls xlsx dbf latex ods'.split()
+    formats_lst=", ".join(supported_formats)
     cli_docs ="""Records: SQL for Humans™
 A Kenneth Reitz project.
 
 Usage:
-  records <query> <format> [<params>...] [--url=<url>]
+  records <query> [<format>] [<params>...] [--url=<url>]
   records (-h | --help)
 
 Options:
@@ -298,7 +466,7 @@ Options:
   --url=<url>   The database URL to use. Defaults to $DATABASE_URL.
 
 Supported Formats:
-   csv, tsv, json, yaml, html, xls, xlsx, dbf, latex, ods
+   %(formats_lst)s
 
    Note: xls, xlsx, dbf, and ods formats are binary, and should only be
          used with redirected output e.g. '$ records sql xls > sql.xls'.
@@ -316,17 +484,22 @@ Notes:
     can be provided instead. Use this feature discernfully; it's dangerous.
   - Records is intended for report-style exports of database queries, and
     has not yet been optimized for extremely large data dumps.
-    """
-    supported_formats = 'csv tsv json yaml html xls xlsx dbf latex ods'.split()
+    """ % dict(formats_lst=formats_lst)
 
     # Parse the command-line arguments.
     arguments = docopt(cli_docs)
 
-    # Create the Database.
-    db = Database(arguments['--url'])
-
     query = arguments['<query>']
     params = arguments['<params>']
+    format = arguments.get('<format>')
+    if format and "=" in format:
+        del arguments['<format>']
+        arguments['<params>'].append(format)
+        format = None
+    if format and format not in supported_formats:
+        print('%s format not supported.' % format)
+        print('Supported formats are %s.' % formats_lst)
+        exit(62)
 
     # Can't send an empty list if params aren't expected.
     try:
@@ -335,29 +508,47 @@ Notes:
         print('Parameters must be given in key=value format.')
         exit(64)
 
-    # Execute the query, if it is a found file.
-    if os.path.isfile(query):
-        rows = db.query_file(query, **params)
+    # Be ready to fail on missing packages
+    try:
+        # Create the Database.
+        db = Database(arguments['--url'])
 
-    # Execute the query, if it appears to be a query string.
-    elif len(query.split()) > 2:
-        rows = db.query(query, **params)
+        # Execute the query, if it is a found file.
+        if os.path.isfile(query):
+            rows = db.query_file(query, **params)
 
-    # Otherwise, say the file wasn't found.
-    else:
-        print('The given query could not be found.')
-        exit(66)
+        # Execute the query, if it appears to be a query string.
+        elif len(query.split()) > 2:
+            rows = db.query(query, **params)
 
-    # Print results in desired format.
-    if arguments['<format>']:
-        print(rows.export(arguments['<format>']))
-    else:
-        print(rows.dataset)
+        # Otherwise, say the file wasn't found.
+        else:
+            print('The given query could not be found.')
+            exit(66)
+
+        # Print results in desired format.
+        if format:
+            content = rows.export(format)
+            if isinstance(content, bytes):
+                print_bytes(content)
+            else:
+                print(content)
+        else:
+            print(rows.dataset)
+    except ImportError as impexc:
+        print(impexc.msg)
+        print("Used database or format require a package, which is missing.")
+        print("Try to install missing packages.")
+        exit(60)
+
+
+def print_bytes(content):
+    try:
+        stdout.buffer.write(content)
+    except AttributeError:
+        stdout.write(content)
+
 
 # Run the CLI when executed directly.
 if __name__ == '__main__':
     cli()
-
-
-
-

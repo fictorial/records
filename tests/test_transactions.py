@@ -1,29 +1,83 @@
-import records
+"""Test manipulating database table in various transaction scenarios.
 
-db = records.Database('sqlite:///:memory:')
+Varying conditions:
 
-db.query('CREATE TABLE foo (a integer)')
+- db for different database backends (see `db` fixture)
+- query run via
 
-def test_failing_transaction():
-    tx = db.transaction()
+    - `db=records.Database(); db.query()
+    - `conn=db.get_connection(); conn.query()`
+
+- transaction
+    - not used at all
+    - used and created in different ways
+    - transaction succeeds
+    - transaction fails or raise
+"""
+import pytest
+
+
+@pytest.mark.usefixtures('foo_table')
+def test_plain_db(db):
+    """Manipulate database by `db.query` without transactions.
+    """
+    db.query('INSERT INTO foo VALUES (42)')
+    db.query('INSERT INTO foo VALUES (43)')
+    assert db.query('SELECT count(*) AS n FROM foo')[0].n == 2
+
+
+@pytest.mark.usefixtures('foo_table')
+def test_plain_conn(db):
+    """Manipulate database by `conn.query` without transactions.
+    """
+    conn = db.get_connection()
+    conn.query('INSERT INTO foo VALUES (42)')
+    conn.query('INSERT INTO foo VALUES (43)')
+    assert conn.query('SELECT count(*) AS n FROM foo')[0].n == 2
+
+
+@pytest.mark.usefixtures('foo_table')
+def test_failing_transaction_self_managed(db):
+    conn = db.get_connection()
+    tx = conn.transaction()
     try:
-        db.query('INSERT INTO foo VALUES (42)')
-        db.query('INSERT INTO foo VALUES (43)')
+        conn.query('INSERT INTO foo VALUES (42)')
+        conn.query('INSERT INTO foo VALUES (43)')
         raise ValueError()
         tx.commit()
-        db.query('INSERT INTO foo VALUES (44)')
-    except:
+        conn.query('INSERT INTO foo VALUES (44)')
+    except ValueError:
         tx.rollback()
     finally:
+        conn.close()
         assert db.query('SELECT count(*) AS n FROM foo')[0].n == 0
 
-def test_passing_transaction():
-    tx = db.transaction()
-    try:
-        db.query('INSERT INTO foo VALUES (42)')
-        db.query('INSERT INTO foo VALUES (43)')
-        tx.commit()
-    except:
-        tx.rollback()
-    finally:
-        assert db.query('SELECT count(*) AS n FROM foo')[0].n == 2
+
+@pytest.mark.usefixtures('foo_table')
+def test_failing_transaction(db):
+    with db.transaction() as conn:
+        conn.query('INSERT INTO foo VALUES (42)')
+        conn.query('INSERT INTO foo VALUES (43)')
+        raise ValueError()
+
+    assert db.query('SELECT count(*) AS n FROM foo')[0].n == 0
+
+
+@pytest.mark.usefixtures('foo_table')
+def test_passing_transaction_self_managed(db):
+    conn = db.get_connection()
+    tx = conn.transaction()
+    conn.query('INSERT INTO foo VALUES (42)')
+    conn.query('INSERT INTO foo VALUES (43)')
+    tx.commit()
+    conn.close()
+    assert db.query('SELECT count(*) AS n FROM foo')[0].n == 2
+
+
+@pytest.mark.usefixtures('foo_table')
+def test_passing_transaction(db):
+    with db.transaction() as conn:
+        conn.query('INSERT INTO foo VALUES (42)')
+        conn.query('INSERT INTO foo VALUES (43)')
+
+    assert db.query('SELECT count(*) AS n FROM foo')[0].n == 2

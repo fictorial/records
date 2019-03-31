@@ -1,3 +1,15 @@
+v0.5.1 (09-01-2017)
+===================
+
+- Depend on ``tablib[pandas]``.
+- Support for Bulk quies: ``Database.bulk_query()`` & ``Database.bulk_query_file()``.
+
+v0.5.0 (11-15-2016)
+===================
+
+- Support for transactions: ``t = Database.transaction(); t.commit()``
+
+
 v0.4.3 (02-16-2016)
 ===================
 
