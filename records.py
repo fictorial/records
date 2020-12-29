@@ -11,8 +11,6 @@ from docopt import docopt
 from sqlalchemy import create_engine, exc, inspect, text
 from sqlalchemy.pool import QueuePool
 
-DATABASE_URL = os.environ.get('DATABASE_URL')
-
 
 def isexception(obj):
     """Given an object, return a boolean indicating whether it is an instance
@@ -254,7 +252,7 @@ class Database(object):
 
     def __init__(self, db_url=None, **kwargs):
         # If no db_url was provided, fallback to $DATABASE_URL.
-        self.db_url = db_url or DATABASE_URL
+        self.db_url = db_url or os.environ.get('DATABASE_URL')
 
         if not self.db_url:
             raise ValueError('You must provide a db_url.')
